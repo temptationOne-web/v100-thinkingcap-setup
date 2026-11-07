@@ -57,6 +57,7 @@ every model I ran as my main brain:
 |---|---|---|---|
 | **ThinkingCap-Qwen3.8-Flash-Next NVFP4** | ~160–170 tok/s | **LCB 55/61**, sample 23/32 | current choice |
 | Ornith-1.5-122B uncensored (my brain before it) | ~170 tok/s | sample 16/32, super-hard set 26 vs ThinkingCap 31 | a bit faster per token, but clearly weaker at code and thinks about twice as long on hard questions |
+| Qwen3.8-27B NVFP4 + DFlash2 (1Cat 1.5.2 release setup) | ~128 chat / ~300 code | LCB 54/61 | same smarts; faster only when writing code, slower chat, 2× slower reading prompts (see below) |
 | Ripple-65B-Preview (dense 65B, NVFP4A16) | 37 tok/s | LCB 47/61 | 4× slower and weaker |
 | GLM-5.3-Flash (2-bit EXL3 experts) | ~60–100 tok/s after tuning | smart | reading prompts started ~3× slower than Flash-Next; after a lot of kernel work still ~1.4× slower (2,100 vs ~3,100 tok/s on 26k). Was my brain for a few days in October |
 | Qwen3.8-27B dense (my brain in summer) | ~65 tok/s (on 2 GPUs) | lower | slower and less capable |
