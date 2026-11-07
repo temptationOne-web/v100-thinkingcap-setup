@@ -1,0 +1,9 @@
+ENGINE 20261106 (LIVE since 2026-11-06 11:45; FLy copy LIVE 14:45) - how to rebuild after a disk loss
+1. venv: python 3.12 venv, `uv pip install --no-deps -r freeze.txt` (torch 2.10.0+cu128 etc.), then the wheel:
+   `uv pip install --no-deps --reinstall dist/1cat_vllm-1.5.2.dev1793+ge098ee11b.cu128-cp312-cp312-linux_x86_64.whl`
+   (backup copy: engine-wheel_<name>.whl in /opt/rag/backups and on the NAS). Source = github 1CatAI/1Cat-vLLM e098ee11b; build.sh.
+2. Ports: `SKIP_WHEEL=1 bash ports/apply-ports.sh` (11 files from ports/stage, 3-way merged; see ports/stage/*.base/.live/.new).
+3. FLy copy: `cp -al .venv ../vllm-main-20261106-fly/.venv`, re-point .venv/bin shebangs, then put
+   fly/rejection_sampler_utils.py over .venv/lib/python3.12/site-packages/vllm/v1/worker/gpu/spec_decode/ (new inode, not in place).
+4. systemd drop-ins (in the system-config backup): 70-e1106.conf + 75-fly.conf (+ 10..65 as before). Launchers + ext: /opt/1cat/tcflash-trial
+   (brain-tc backup). Model: /opt/1cat/models-tcflash/ThinkingCap-Qwen3.8-Flash-Next-NVFP4 (bottlecapai on Hugging Face; NOT backed up, re-download).

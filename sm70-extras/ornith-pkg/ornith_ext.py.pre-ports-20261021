@@ -1,0 +1,172 @@
+"""ornith_ext — worker extension for the Ornith-1.5-122B UNCENSORED NVFP4 TRIAL (2026-10-21). No engine file is edited.
+
+Runtime patches (installed at import time, i.e. inside each vLLM worker before the model is built):
+  1. nvfp4_sm70_moe: admit the Ornith/Qwen3.5-122B expert contract (hidden 3072, inter 1024, 256 experts, top-8)
+     to the native SM70 TurboMind NVFP4 MoE route (the engine only lists the shapes 1Cat validated).
+  2. ModelOptMixedPrecisionConfig.get_quant_method: this engine maps FP8_PER_CHANNEL_PER_TOKEN Linear layers
+     (308 of them here: GDN/attention/shared-expert projections + lm_head) to UnquantizedLinearMethod, which would load
+     raw FP8 codes without their scales. We give them an SM70 W8A16 method instead:
+       ORN_FP8_MODE=qpn8 (default): checkpoint FP8 codes + per-output-channel scales packed into the engine's QPN8
+                                    kernels (exact same dequant product, FP16 activations, 1 byte/weight).
+       ORN_FP8_MODE=fp16          : dequantize to FP16 once at load (exact, 2 bytes/weight, cuBLAS).
+  3. memguard (MemGuardExt from /opt/1cat/swiftfn-trial, URLs from MEMGUARD_* env).
+  4. optional SB-CAR int8 prefill all-reduce (SB_CAR=1, same package/settings as Swift prod P4).
+"""
+import os
+import sys
+
+import torch
+from torch.nn import Parameter
+
+_TAG = f"ORNITH-EXT pid {os.getpid()}"
+
+
+def _say(msg):
+    print(f"{_TAG}: {msg}", file=sys.stderr, flush=True)
+
+
+# ---- 1. NVFP4 MoE contract -------------------------------------------------------------------------------------
+try:
+    from vllm.model_executor.layers.quantization import nvfp4_sm70_moe as _nm
+
+    _nm._SUPPORTED_CONTRACTS.add((3072, 1024, 256, 8))
+    _say(f"nvfp4 contracts now {sorted(_nm._SUPPORTED_CONTRACTS)}")
+except Exception as exc:  # pragma: no cover
+    _say(f"contract patch FAILED {exc!r}")
+
+# ---- 2. FP8 per-channel linear -> QPN8 / FP16 --------------------------------------------------------------------
+from vllm.model_executor.layers.linear import LinearBase, LinearMethodBase  # noqa: E402
+from vllm.model_executor.layers.quantization import modelopt as _mo  # noqa: E402
+from vllm.model_executor.layers.quantization import sm70_turbomind as _tm  # noqa: E402
+from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead  # noqa: E402
+from vllm.model_executor.parameter import ChannelQuantScaleParameter, ModelWeightParameter  # noqa: E402
+
+_MODE = os.environ.get("ORN_FP8_MODE", "qpn8")
+_COUNTS = {"qpn8": 0, "fp16": 0}
+
+
+class OrnFp8PcLinearMethod(LinearMethodBase):
+    """FP8 e4m3 weight [N,K] + fp32 per-output-channel scale [N]; FP16 activations (no activation quant)."""
+
+    def create_weights(self, layer, input_size_per_partition, output_partition_sizes, input_size, output_size,
+                       params_dtype, **extra_weight_attrs):
+        weight_loader = extra_weight_attrs.get("weight_loader")
+        n = sum(output_partition_sizes)
+        layer.logical_widths = output_partition_sizes
+        layer.input_size_per_partition = input_size_per_partition
+        layer.output_size_per_partition = n
+        layer.orig_dtype = params_dtype
+        w = ModelWeightParameter(data=torch.empty(n, input_size_per_partition, dtype=torch.float8_e4m3fn),
+                                 input_dim=1, output_dim=0, weight_loader=weight_loader)
+        layer.register_parameter("weight", w)
+        s = ChannelQuantScaleParameter(data=torch.empty(n, dtype=torch.float32), output_dim=0,
+                                       weight_loader=weight_loader)
+        s[:] = torch.finfo(torch.float32).min
+        layer.register_parameter("weight_scale", s)
+
+    def process_weights_after_loading(self, layer):
+        w = layer.weight.data
+        s = layer.weight_scale.data.to(torch.float32).reshape(-1, 1)
+        if bool((s <= 0).any()):
+            raise RuntimeError(f"ORNITH-EXT: unloaded/invalid FP8 channel scale in a layer of shape {tuple(w.shape)}")
+        n, k = (int(d) for d in w.shape)
+        mode = _MODE
+        if mode == "qpn8":
+            try:
+                if n % 32 or k % 16:
+                    raise RuntimeError(f"shape N={n} K={k}")
+                _tm.fp8_qpn8_launch_config(k)
+                from vllm import _sm70_ops as ops
+
+                codes, gscales = ops.fp8_qpn8_prepare_sm70(w.contiguous(), s.contiguous())
+                layer.register_buffer("_orn_qpn8_codes", codes, persistent=False)
+                layer.register_buffer("_orn_qpn8_scales", gscales, persistent=False)
+                sk, ch, pf = _tm.fp8_qpn8_launch_config(k)
+                setattr(layer, _tm.FP8_QPN8_STATE_ATTR, _tm.FP8QPN8LinearState(codes, gscales, n, sk, ch, pf))
+                layer.weight = Parameter(w.new_empty(0), requires_grad=False)
+                layer.weight_scale = Parameter(layer.weight_scale.data.new_empty(0), requires_grad=False)
+                layer._orn_qpn8 = True
+                _COUNTS["qpn8"] += 1
+                return
+            except Exception as exc:
+                _say(f"QPN8 not possible for N={n} K={k} ({exc!r}) -> fp16")
+        layer.weight = Parameter((w.to(torch.float32) * s).to(torch.float16), requires_grad=False)
+        setattr(layer, _tm.FP8_QPN8_STATE_ATTR, None)
+        layer.weight_scale = Parameter(layer.weight_scale.data.new_empty(0), requires_grad=False)
+        _COUNTS["fp16"] += 1
+
+    def apply(self, layer, x, bias=None):
+        if getattr(layer, "_orn_qpn8", False):
+            return _tm.apply_prepared_fp8_qpn8_linear(layer, x, bias)
+        return torch.nn.functional.linear(x, layer.weight, bias)
+
+
+_orig_gqm = _mo.ModelOptMixedPrecisionConfig.get_quant_method
+
+
+def _gqm(self, layer, prefix):
+    if isinstance(layer, (LinearBase, ParallelLMHead)) and not self.is_layer_excluded(prefix):
+        algo = self._resolve_quant_algo(prefix)
+        if algo == "FP8_PER_CHANNEL_PER_TOKEN":
+            return OrnFp8PcLinearMethod()
+    return _orig_gqm(self, layer, prefix)
+
+
+_mo.ModelOptMixedPrecisionConfig.get_quant_method = _gqm
+_say(f"FP8_PER_CHANNEL_PER_TOKEN linear -> OrnFp8PcLinearMethod (mode {_MODE})")
+
+
+def orn_counts():
+    return dict(_COUNTS)
+
+
+# ---- 4. optional SB-CAR (Swift prod P4, model-agnostic all-reduce hook) -------------------------------------------
+if os.environ.get("SB_CAR", "0") == "1":
+    _pkg = os.environ.get("SB_CAR_PKG", "/opt/1cat/swiftfn-trial/sbcar")
+    if _pkg not in sys.path:
+        sys.path.insert(0, _pkg)
+    import importlib.abc
+    import importlib.util
+
+    _TARGET = "vllm.distributed.device_communicators.cuda_communicator"
+
+    def _car_install():
+        try:
+            import sb_car
+
+            sb_car.install()
+            _say("SB-CAR installed")
+        except Exception as exc:
+            _say(f"SB-CAR install failed {exc!r}")
+
+    class _PostImport(importlib.abc.MetaPathFinder):
+        def find_spec(self, fullname, path, target=None):
+            if fullname != _TARGET:
+                return None
+            sys.meta_path.remove(self)
+            spec = importlib.util.find_spec(fullname)
+            if spec is None or spec.loader is None:
+                return spec
+            real_exec = spec.loader.exec_module
+
+            def exec_module(module):
+                real_exec(module)
+                _car_install()
+
+            spec.loader.exec_module = exec_module
+            return spec
+
+    if _TARGET in sys.modules:
+        _car_install()
+    else:
+        sys.meta_path.insert(0, _PostImport())
+
+# ---- 3. memguard ---------------------------------------------------------------------------------------------------
+if "/opt/1cat/swiftfn-trial" not in sys.path:
+    sys.path.append("/opt/1cat/swiftfn-trial")
+from memguard_ext import MemGuardExt  # noqa: E402  (starts the memguard thread)
+
+
+class OrnithExt(MemGuardExt):
+    def ornith_counts(self):
+        return orn_counts()
