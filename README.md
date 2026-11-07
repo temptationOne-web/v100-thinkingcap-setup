@@ -59,7 +59,7 @@ every model I ran as my main brain:
 | Ornith-1.5-122B uncensored (my brain before it) | ~170 tok/s | sample 16/32, super-hard set 26 vs ThinkingCap 31 | a bit faster per token, but clearly weaker at code and thinks about twice as long on hard questions |
 | Ripple-65B-Preview (dense 65B, NVFP4A16) | 37 tok/s | LCB 47/61 | 4× slower and weaker |
 | GLM-5.3-Flash (EXL3) | — | smart | reading prompts ~10× slower on V100 |
-| Qwen3.8-27B dense (my brain in summer) | ~65 tok/s | lower | slower and less capable |
+| Qwen3.8-27B dense (my brain in summer) | ~65 tok/s (on 2 GPUs) | lower | slower and less capable |
 
 Same Flash-Next architecture as Swift-1.5 / Ornith, so all the V100 speed work carries over. Vision, tool calling and
 262k context all work.
