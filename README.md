@@ -205,6 +205,45 @@ Context 262,144 tokens. GPU KV pool 339,200 tokens shared by all requests.
 | Ripple-65B-Preview Q4_K_M | llama.cpp, `-sm tensor -fa on` | 23–24 | — | slow |
 | Ripple-65B + DFlash2 drafter | llama.cpp | 21–23 code, 9–10 chat | — | drafter hurts chat |
 
+## Other V100 setups I compared (7 Nov 2026)
+
+### 1Cat 1.5.2's own 27B demo, run on my rig
+
+1Cat's 1.5.2 page shows the 27B at "500+ tok/s". Their test machine is 4× V100-SXM2-32GB **with NVLink at 350 W**.
+I ran the **identical software** on my rig: 1Cat v1.5.2, their release launcher `serve_qwen38_27b_nvfp4_v100.sh`,
+Unsloth Qwen3.8-27B NVFP4 + DFlash2, and their HumanEval test (decode-only timing). The only differences are my
+hardware (PCIe, no NVLink) and power (150 W per GPU).
+
+| Test | 1Cat's NVLink box, 350 W | 27B on my rig | ThinkingCap on my rig |
+|---|---|---|---|
+| HumanEval, 1 user, temp 0.6 (decode only) | 578 tok/s | 301 | 232 |
+| HumanEval, 1 user, temp 0 | — | 306 | 234 |
+| HumanEval, 4 users, temp 0, total | ~750 (decode only) | 399 decode / 276 incl. prompt reading | 364 decode / 320 incl. prompt reading |
+| Normal chat (temp 1), 1 user | — | 128 | ~160 |
+| Normal chat, 4 users, total | — | 261 | ~341 |
+| Reading a 54k prompt (QUASAR 27B, same release profile) | — | 42.5 s | 20.5 s |
+| LiveCodeBench easy+medium, 61 problems (QUASAR 27B) | — | 54/61 | 55/61 |
+
+**Takeaways:**
+- On PCIe at 150 W, the same 27B setup reaches about half of 1Cat's NVLink number.
+- The 27B is faster at **writing code**, because its DFlash2 drafter guesses code very well.
+- ThinkingCap is faster at normal chat, with several users at once, and at reading long prompts.
+- Both score the same on coding.
+- 1Cat's 487 / 1224 tok/s figures are computed from step time at a 70% acceptance rate (their page says so). 578 is their measured HumanEval number.
+
+**Note:** ThinkingCap on the 1.5.2 engine with my patches did not work yet (answers cut off early, slow with 4 users). This repo stays on 1Cat main `e098ee11b`.
+
+### ReVolta
+
+[ReVolta](https://github.com/Leonccaa/ReVolta) is another 1Cat-vLLM based engine for 4× V100 + Qwen3.8 Flash-Next.
+I reviewed it on 4 Nov 2026:
+- **Speed:** its single-user numbers (152–163 tok/s at 250 W) were a tie with mine (~160 at 150 W).
+- **Strengths:** far more KV room (1M+ tokens with E4M3 KV and decode context parallel) and a disk KV tier.
+- **Why I stayed on 1Cat:** it is tuned for NVLink or GPUs behind a single PCIe switch, and my GPUs are plain PCIe (PHB). It also did not support ThinkingCap's checkpoint format without repacking.
+- **What I took:** its fix **#74** (`num_warps=1` in the rejection sampler), included in `engine/ports/stage/`.
+
+---
+
 ## 7. Lessons (things that cost me time)
 
 1. **Patch site-packages, not `src/`.** Check with `python -c "import vllm; print(vllm.__file__)"` run from a different folder.

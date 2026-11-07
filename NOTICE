@@ -9,5 +9,5 @@ Credits:
 - vLLM project (https://github.com/vllm-project/vllm)
 - 1Cat-vLLM, the SM70 (V100) fork of vLLM (https://github.com/1CatAI/1Cat-vLLM)
 - FLy lossy verification: ported from upstream vLLM PR #53987
-- ReVolta V100 engine work: #74 (num_warps=1 rejection sampler)
+- ReVolta (https://github.com/Leonccaa/ReVolta): fix #74 (num_warps=1 rejection sampler)
 - Model: bottlecapai/ThinkingCap-Qwen3.8-Flash-Next-NVFP4 (see its own licence on Hugging Face; not included here)
