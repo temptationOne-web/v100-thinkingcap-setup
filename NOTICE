@@ -11,3 +11,5 @@ Credits:
 - FLy lossy verification: ported from upstream vLLM PR #53987
 - ReVolta (https://github.com/Leonccaa/ReVolta): fix #74 (num_warps=1 rejection sampler)
 - Model: bottlecapai/ThinkingCap-Qwen3.8-Flash-Next-NVFP4 (see its own licence on Hugging Face; not included here)
+
+engine/ports/freeze-fix/workspace.py.diff is a change to vLLM / 1Cat-vLLM source (Apache License 2.0).

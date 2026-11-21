@@ -10,8 +10,23 @@ the repo to your AI coding assistant and ask it to reproduce the setup.
 
 **What you get on 4× V100 (measured):** ~160–170 tok/s for one user, ~340 tok/s total for four users,
 LiveCodeBench easy+medium 55/61, 262k context, tool calls and JSON output working.
+**New (21 Nov):** a **524k-token context** setup (YaRN ×2 + my accuracy fix), ~150–157 tok/s for one user, LCB 56/61 (§7).
 
 **What is NOT here:** the model weights (download from Hugging Face, link below), and nothing private.
+
+### What's original here (my work)
+
+- **The whole V100 PCIe (no NVLink) recipe**: every setting, flag and patch combination below, tuned and gated on real hardware.
+- **NVFP4 experts → SM70 TurboMind route** (`VLLM_SM70_CT_NVFP4_TM`): bridges compressed-tensors checkpoints onto the tuned
+  V100 MoE path. 1 user 80 → 114 tok/s, the single biggest win.
+- **Adaptive MTP drafts** (fewer drafts on long chats), packed-only/FP16 GEMV fast paths for Qwen3.8, PCIe-P2P-as-full all-reduce.
+- **Long-read freeze fix** (`engine/ports/freeze-fix/`): found and fixed a 4-GPU deadlock when the engine freed GPU memory
+  mid-forward during long reads.
+- **524k context with an accuracy fix ("Fix A")**: YaRN ×2 plus corrected attention scaling and ramp settings for this
+  model; tracking of values that change many times in a long chat went from 85% → 92% at 384k (§7).
+- **Exhaustive questions over huge documents**: piece-by-piece reading with code-checked answers, 100% at 768k vs 88%
+  reading in one pass (§7).
+- **The test kit**: go-live gates (tool calls, JSON soak, reproducibility), long-context drift tests, benchmarks.
 
 ### Quick start (most of the speed, least work)
 1. Hardware/OS: 4× V100 32GB, NVIDIA driver 580.x, CUDA 12.8, add `iommu=pt` to the kernel command line.
@@ -245,7 +260,80 @@ I reviewed it on 4 Nov 2026:
 
 ---
 
-## 7. Lessons (things that cost me time)
+## 7. Long context: 524k tokens per chat (added 21 Nov 2026)
+
+The model is trained to 262,144 tokens. I run it at **524,288** with YaRN ×2 plus my accuracy fix, on the same 4× V100.
+
+**1. Model config overlay.** Copy the model folder (symlink the weights) and change only `text_config.rope_parameters` in
+`config.json`:
+```json
+"rope_type": "yarn", "factor": 2.0, "original_max_position_embeddings": 262144,
+"attn_factor": 0.9351783746304286, "beta_fast": 128, "beta_slow": 4
+```
+Keep the model's own `rope_theta`, `partial_rotary_factor` and `mrope_*` values. Why the last three ("Fix A"): the engine's
+YaRN already multiplies attention by mscale = 0.1·ln(factor)+1, and its ramp is computed against 4× the original length;
+`attn_factor` = 1/mscale brings the scale back to 1.0 and 4× betas restore the intended ramp. Without them, recall of
+values updated many times in a long chat drops noticeably past ~350k.
+
+**2. Launch changes** (on top of §4):
+```bash
+export VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
+--max-model-len 524288 --decode-context-parallel-size 2 --prefix-cache-retention-interval 8320
+```
+DCP2 splits the chat memory across GPU pairs so 524k fits (KV pool ~637k tokens). Cost: ~5–8% slower for one user.
+
+**3. Freeze fix** (`engine/ports/freeze-fix/workspace.py.diff`): without it, long reads with DCP can deadlock all 4 GPUs.
+
+**Results (same machine):**
+
+| Test | 262k setup | 524k + Fix A |
+|---|---|---|
+| 1 user / 4 users total | ~160–170 / ~340 tok/s | ~150–157 / ~330 tok/s |
+| LiveCodeBench easy+medium | 55/61 | 56/61 |
+| Needle / multi-fact / multi-hop recall | 100% to 262k | 100% to 468k (tested, thinking on) |
+| Value tracked through many updates (per-line recall) | — | 92% at 384k, 90% at 468k (85% / 88% without Fix A) |
+| Tool calls / 60-min JSON soak / reproducibility | pass | pass |
+
+**Huge documents (768k+):** for "find every… / how many / final value after all changes" questions, reading the document
+in ~50k-token pieces and computing the answer in code (each quoted line checked against the file) scored **100%** at 768k;
+reading it in one pass scored 88%. Read normally for summaries and questions that connect distant parts.
+
+**I keep chats compacted at ~450k** so they stay in the accurate zone.
+
+### Option: ~1M tokens per chat (works, but I chose not to run it daily)
+
+You *can* run ~1,000,000 tokens on the same 4× V100. Pick based on what you need: **stable + fast (524k, above)** or
+**maximum context with the trade-offs below**. Your AI assistant can set up either from these notes.
+
+**Settings (differences from the 524k setup):**
+```json
+"rope_type": "yarn", "factor": 4.0, "original_max_position_embeddings": 262144,
+"attn_factor": 0.8782488562869419, "beta_fast": 128, "beta_slow": 4
+```
+(`attn_factor` = 1 / (0.1·ln 4 + 1), same "Fix A" logic as above.)
+```bash
+--max-model-len 1000000 --decode-context-parallel-size 2 --kv-cache-dtype fp8_e4m3 --prefix-cache-retention-interval 8160
+```
+FP8 KV is required to fit it (KV pool ~1.14M tokens = room for **one** ~1M chat at a time). I used **calibrated** FP8 KV
+scales (a `model-kvscales.safetensors` file next to the weights). The freeze fix above is required.
+
+**What I measured (thinking on):**
+
+| | 524k (my daily) | ~1M option |
+|---|---|---|
+| Facts / multi-fact / multi-hop recall | 100% to 468k | 100% to 768k, **drops to 67% at 927k** |
+| Value tracked through many updates, one pass | 90% at 468k | 88% at 768k |
+| Speed, normal short chats (1 user) | ~150–157 tok/s | ~127 tok/s (**~20% slower on every chat**) |
+| Reading a 768k prompt | — | ~8 min before the first word |
+| Run-to-run identical output (my reproducibility gate) | pass | **failed** with FP8 KV in my earlier test |
+
+**Why I don't run it daily:** almost no chat needs more than ~450k, but the slowdown hits every message; the usable
+ceiling is really ~768k, not 1M; and I need identical output run-to-run for one of my apps, which FP8 KV broke.
+For huge documents I use piece-by-piece reading instead (100% at 768k, see above). If you need one giant document in a
+single chat and can accept slower everyday speed, the 1M option is a valid choice. Note: my 1M tests ran on my engine
+build with extra stability fixes; gate it yourself (tool calls, JSON soak, recall at your target length) before relying on it.
+
+## 8. Lessons (things that cost me time)
 
 1. **Patch site-packages, not `src/`.** Check with `python -c "import vllm; print(vllm.__file__)"` run from a different folder.
 2. **`iommu=pt`** on a no-NVLink board was a free +11%.
@@ -255,5 +343,12 @@ I reviewed it on 4 Nov 2026:
 6. **RAM chat cache (KV offload)** works on engine e098ee11b only with my old kv-shift patch off (`ORN_MTP_KVFIX=0`). I keep it off because hybrid-PLE needs the RAM.
 7. **Gate every change** with tool-call tests, a JSON-schema soak and a reproducibility check, not only `/health`. One speed patch passed every speed test and still broke JSON requests in production.
 8. **DFlash/DFlash2 drafters lost to the model's own MTP head** every time on V100 for me.
+
+## Built on
+
+- [vLLM](https://github.com/vllm-project/vllm) and [1Cat-vLLM](https://github.com/1CatAI/1Cat-vLLM) (the SM70 fork), Apache 2.0.
+  Modified files are listed in `NOTICE`.
+- FLy lossy verification: port of vLLM PR #53987. Rejection-sampler `num_warps=1`: from [ReVolta](https://github.com/Leonccaa/ReVolta) #74.
+- Model: [bottlecapai/ThinkingCap-Qwen3.8-Flash-Next-NVFP4](https://huggingface.co/bottlecapai/ThinkingCap-Qwen3.8-Flash-Next-NVFP4) (own licence, not included).
 
 Questions: ask JJ in the group.

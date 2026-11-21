@@ -1,0 +1,19 @@
+--- a/vllm/v1/worker/workspace.py	2026-11-06 01:41:11.205621656 +1030
++++ b/vllm/v1/worker/workspace.py	2026-11-20 12:08:05.671203937 +1030
+@@ -172,7 +172,15 @@
+             # allocation below. Without this, each resize may leave a
+             # dead segment in reserved memory which can cause higher peak
+             # memory usage.
+-            torch.accelerator.empty_cache()
++            # 2026-11-20 FREEZE FIX (rig): empty_cache() here = cudaFree in the middle of a forward pass. With the
++            # 4 ranks mid cross-GPU exchange (DCP all-to-all / P2P all-reduce) cuMemFree blocks on device sync and
++            # every rank deadlocks (GPUs idle, RPC sample_tokens timeout). Keep the cached segment instead.
++            if os.environ.get("VLLM_WORKSPACE_EMPTY_CACHE", "0") == "1":
++                torch.accelerator.empty_cache()
++            _pre = int(os.environ.get("VLLM_WORKSPACE_MIN_MB", "0")) * _MB
++            required_bytes = max(required_bytes, _pre, int(current_size * 1.5))   # grow with headroom: fewer resizes
++            logger.warning("[WORKSPACE] resize %.1f MB -> %.1f MB (ubatch %d) from %s", current_size / _MB,
++                           required_bytes / _MB, ubatch_id, get_caller_info())
+             self._current_workspaces[ubatch_id] = torch.empty(
+                 (required_bytes,), dtype=torch.uint8, device=self._device
+             )
